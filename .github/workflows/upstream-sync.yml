@@ -1,0 +1,70 @@
+name: upstream-sync
+on:
+  schedule:
+    - cron: "0 6 * * MON"
+  workflow_dispatch:
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/cloudflare/agentic-inbox.git || true
+          git fetch upstream main
+
+      - name: Create rebase branch
+        id: branch
+        run: |
+          DATE=$(date +%Y%m%d)
+          BRANCH="ak/upstream-sync-$DATE"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH"
+
+      - name: Rebase onto upstream/main
+        id: rebase
+        run: |
+          set +e
+          git rebase upstream/main
+          STATUS=$?
+          if [ $STATUS -ne 0 ]; then
+            echo "rebase_conflict=true" >> "$GITHUB_OUTPUT"
+            git rebase --abort || true
+            git reset --hard origin/ak/main
+          else
+            echo "rebase_conflict=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Push branch and open PR
+        if: steps.rebase.outputs.rebase_conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: ${{ steps.branch.outputs.name }}
+        run: |
+          git push --force-with-lease origin "$BRANCH_NAME"
+          DATE=$(date +%Y-%m-%d)
+          gh pr create \
+            --title "upstream sync: rebase onto upstream/main ($DATE)" \
+            --body "Automated weekly rebase against cloudflare/agentic-inbox main. If the PR checks are green and no patched files conflicted, you can merge. If checks fail, inspect the diff and fix forward on this branch." \
+            --base ak/main \
+            --head "$BRANCH_NAME" || echo "PR may already exist"
+
+      - name: Surface conflict
+        if: steps.rebase.outputs.rebase_conflict == 'true'
+        run: |
+          echo "::warning::Rebase had conflicts. Manual intervention required: git fetch upstream && git rebase upstream/main on ak/main locally."
+          exit 1

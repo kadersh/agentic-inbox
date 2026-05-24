@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "agentic-inbox",
+	"name": "inbox-haouache",
 	"compatibility_date": "2025-11-28",
 	"main": "./workers/app.ts",
 	"observability": {
@@ -9,12 +9,39 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"workers_dev": false,
+	"routes": [
+		{
+			"pattern": "inbox.haouache.com",
+			"custom_domain": true
+		}
+	],
 	"vars": {
-		// Production deploys must also define POLICY_AUD and TEAM_DOMAIN.
-		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
-		// The worker now fails closed outside local development if Access is not configured.
-		"DOMAINS": "example.com",
-		"EMAIL_ADDRESSES": []
+		// DOMAINS — comma-separated list of domains we receive email for.
+		// EMAIL_ADDRESSES — explicit allowlist of mailbox addresses on those domains.
+		//   If non-empty, only matching inbound recipients are accepted; everything
+		//   else is dropped by the Worker before it ever creates a mailbox.
+		// The six aliases below are the ones routed to this Worker by Cloudflare
+		// Email Routing (configured in scripts/provision-dns.sh). The catch-all
+		// rule forwards anything else on haouache.com to akhaouache@gmail.com.
+		"DOMAINS": "haouache.com",
+		"EMAIL_ADDRESSES": [
+			"agent@haouache.com",
+			"ai@haouache.com",
+			"inbox@haouache.com",
+			"hermes@haouache.com",
+			"support@haouache.com",
+			"forceraft@haouache.com"
+		],
+		// Drafter default. Per-mailbox override lives in the mailbox R2 settings
+		// (`agentDrafter: "claude" | "kimi"`). Daily Claude spend is capped at
+		// $1 by default — see workers/lib/drafter.ts.
+		"DEFAULT_DRAFTER": "kimi",
+		// Matrix room for new-email notifications. Token + room ID are secrets.
+		"MATRIX_HOMESERVER": "https://matrix.haouache.com",
+		// agentmemory endpoint. Reachable from Workers over the public internet
+		// — the existing memory.haouache.com tunnel exposes it. Secret carries auth.
+		"AGENTMEMORY_URL": "https://memory.haouache.com"
 	},
 	"send_email": [
 		{
@@ -25,8 +52,8 @@
 	"r2_buckets": [
 		{
 			"binding": "BUCKET",
-			"bucket_name": "agentic-inbox",
-			"preview_bucket_name": "agentic-inbox"
+			"bucket_name": "inbox-haouache-attachments",
+			"preview_bucket_name": "inbox-haouache-attachments"
 		}
 	],
 	"ai": {

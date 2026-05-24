@@ -20,6 +20,8 @@ import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import { notifyMatrix } from "./sidecars/matrix";
+import { syncToMemory } from "./sidecars/agentmemory";
 
 type AppContext = Context<MailboxContext>;
 
@@ -296,17 +298,42 @@ app.delete("/api/v1/mailboxes/:mailboxId/folders/:id", async (c: AppContext) => 
 
 // -- Search ---------------------------------------------------------
 
+// Upstream issue #36 — long / wildcarded queries can stall SQLite LIKE scans
+// and return 500. We clamp length and neutralise LIKE wildcards on every
+// free-text field so a stray `%` no longer turns into a full-table OR-scan.
+const SEARCH_QUERY_MAX = 256;
+
+function sanitiseSearchInput(raw: string | undefined | null): string | undefined {
+	if (raw === undefined || raw === null) return undefined;
+	const trimmed = raw.trim();
+	if (!trimmed) return undefined;
+	const clamped = trimmed.slice(0, SEARCH_QUERY_MAX);
+	// SQLite LIKE wildcards: % matches any seq, _ matches any one char.
+	// Escape both so the query is a literal substring match.
+	return clamped.replace(/[\\%_]/g, "\\$&");
+}
+
 app.get("/api/v1/mailboxes/:mailboxId/search", async (c: AppContext) => {
+	const rawQuery = c.req.query("query") || "";
 	const searchOpts: Record<string, unknown> = {
-		query: c.req.query("query") || "", folder: c.req.query("folder"), from: c.req.query("from"),
-		to: c.req.query("to"), subject: c.req.query("subject"), date_start: c.req.query("date_start"),
+		query: sanitiseSearchInput(rawQuery) ?? "",
+		folder: c.req.query("folder"),
+		from: sanitiseSearchInput(c.req.query("from")),
+		to: sanitiseSearchInput(c.req.query("to")),
+		subject: sanitiseSearchInput(c.req.query("subject")),
+		date_start: c.req.query("date_start"),
 		date_end: c.req.query("date_end"), is_read: boolQuery(c, "is_read"),
 		is_starred: boolQuery(c, "is_starred"), has_attachment: boolQuery(c, "has_attachment"),
 	};
 	const stub = c.var.mailboxStub as any;
-	const emails = await stub.searchEmails({ ...searchOpts, page: intQuery(c, "page"), limit: intQuery(c, "limit") });
-	const totalCount = await stub.countSearchResults(searchOpts);
-	return c.json({ emails, totalCount });
+	try {
+		const emails = await stub.searchEmails({ ...searchOpts, page: intQuery(c, "page"), limit: intQuery(c, "limit") });
+		const totalCount = await stub.countSearchResults(searchOpts);
+		return c.json({ emails, totalCount });
+	} catch (e) {
+		console.warn("search failed, returning empty result:", (e as Error).message);
+		return c.json({ emails: [], totalCount: 0 });
+	}
 });
 
 // -- Attachments ----------------------------------------------------
@@ -345,22 +372,35 @@ async function streamToArrayBuffer(stream: ReadableStream, streamSize: number) {
 	return result;
 }
 
-async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env: Env, ctx: ExecutionContext) {
+async function receiveEmail(
+	event: { raw: ReadableStream; rawSize: number; to?: string; from?: string },
+	env: Env,
+	ctx: ExecutionContext,
+) {
 	const rawEmail = await streamToArrayBuffer(event.raw, event.rawSize);
 	const parsedEmail = await new PostalMime().parse(rawEmail);
 
 	if (!parsedEmail.to?.length || !parsedEmail.to[0].address) throw new Error("received email with empty to");
 
 	const allowedAddresses = ((env.EMAIL_ADDRESSES ?? []) as string[]).map((a) => a.toLowerCase());
+	// Upstream issue #32 — routing must follow the SMTP envelope (RFC 5321),
+	// not the `To:` header (RFC 5322). A BCCed or aliased address only shows
+	// up in the envelope; trusting the header lets undirected mail slip into
+	// the wrong mailbox (or get dropped). We prefer `event.to`, falling back
+	// to header recipients for local dev where the envelope isn't populated.
+	const envelopeTo = event.to?.toLowerCase();
 	const allRecipients = parsedEmail.to.map((t) => t.address?.toLowerCase()).filter(Boolean) as string[];
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
+	const routingCandidates = envelopeTo
+		? [envelopeTo, ...allRecipients.filter((a) => a !== envelopeTo)]
+		: allRecipients;
 
 	let mailboxId: string | undefined;
 	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
+		mailboxId = routingCandidates.find((addr) => allowedAddresses.includes(addr));
 		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
+	} else { mailboxId = routingCandidates[0]; }
 	if (!mailboxId) throw new Error("received email with no valid recipient address");
 
 	const messageId = crypto.randomUUID();
@@ -402,11 +442,30 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 		thread_id: threadId, message_id: originalMessageId, raw_headers: JSON.stringify(parsedEmail.headers),
 	}, attachmentData);
 
+	const senderAddr = (parsedEmail.from?.address || "").toLowerCase();
+	const subject = parsedEmail.subject || "";
+
 	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
 	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
 		method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
+		body: JSON.stringify({ mailboxId, emailId: messageId, sender: senderAddr, subject, threadId }),
 	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
+
+	// Best-effort fan-out to Matrix + agentmemory. Never block delivery.
+	const bodyPreview = parsedEmail.text
+		? parsedEmail.text.replace(/\s+/g, " ").trim().slice(0, 240)
+		: undefined;
+	ctx.waitUntil(
+		notifyMatrix(env, {
+			mailboxId, sender: senderAddr, subject, threadId, emailId: messageId, bodyPreview,
+		}).catch((e) => console.warn("matrix notify failed:", (e as Error).message)),
+	);
+	ctx.waitUntil(
+		syncToMemory(env, {
+			event: "email_received", mailboxId, emailId: messageId, threadId,
+			subject, sender: senderAddr,
+		}).catch((e) => console.warn("agentmemory sync failed:", (e as Error).message)),
+	);
 }
 
 export { app, receiveEmail };

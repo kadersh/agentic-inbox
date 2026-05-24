@@ -9,7 +9,6 @@ import {
 	convertToModelMessages,
 	stepCountIs,
 } from "ai";
-import { createWorkersAI } from "workers-ai-provider";
 import { z } from "zod";
 import type { EmailFull, EmailMetadata } from "../lib/schemas";
 import { verifyDraft, isPromptInjection } from "../lib/ai";
@@ -29,6 +28,7 @@ import {
 	toolMoveEmail,
 	toolDiscardDraft,
 } from "../lib/tools";
+import { pickModel, readMailboxDrafter, recordClaudeUsage } from "../lib/drafter";
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
 
@@ -276,17 +276,26 @@ export class EmailAgent extends AIChatAgent<any> {
 	async onChatMessage(onFinish: any) {
 		const env = this.env as Env;
 		const mailboxId = this.name;
-		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, mailboxId);
 		const systemPrompt = await getSystemPrompt(env, mailboxId);
 
+		const mailboxHint = await readMailboxDrafter(env, mailboxId);
+		const { model, choice } = await pickModel(env, mailboxHint);
+
 		const result = streamText({
-			model: workersai("@cf/moonshotai/kimi-k2.5"),
+			model,
 			system: systemPrompt,
 			messages: await convertToModelMessages(this.messages),
 			tools,
 			stopWhen: stepCountIs(5),
-			onFinish,
+			onFinish: async (event: any) => {
+				if (choice === "claude" && event?.usage) {
+					await recordClaudeUsage(env, event.usage);
+				}
+				if (typeof onFinish === "function") {
+					await onFinish(event);
+				}
+			},
 		});
 
 		return result.toUIMessageStreamResponse();
@@ -334,9 +343,10 @@ export class EmailAgent extends AIChatAgent<any> {
 		threadId: string;
 	}) {
 		const env = this.env as Env;
-		const workersai = createWorkersAI({ binding: env.AI });
 		const tools = createEmailTools(env, emailData.mailboxId);
 		const systemPrompt = await getSystemPrompt(env, emailData.mailboxId);
+		const mailboxHint = await readMailboxDrafter(env, emailData.mailboxId);
+		const { model, choice } = await pickModel(env, mailboxHint);
 
 		// Pre-read the email and thread so the agent has full context
 		// without needing to waste tool calls discovering it
@@ -463,12 +473,16 @@ Based on the email content and thread context above, draft a reply using draft_r
 
 		try {
 			const result = await generateText({
-				model: workersai("@cf/moonshotai/kimi-k2.5"),
+				model,
 				system: systemPrompt,
 				messages: await convertToModelMessages(messages),
 				tools,
 				stopWhen: stepCountIs(5),
 			});
+
+			if (choice === "claude" && (result as any).usage) {
+				await recordClaudeUsage(env, (result as any).usage);
+			}
 
 			// Check if draft_reply was called (saves to Drafts as side effect).
 			// If NOT, save the agent's text response as a draft directly.

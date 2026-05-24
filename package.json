@@ -34,6 +34,7 @@
 		"@tiptap/extension-underline": "3.20.2",
 		"@tiptap/react": "3.20.2",
 		"@tiptap/starter-kit": "3.20.2",
+		"@ai-sdk/anthropic": "^2.0.43",
 		"agents": "^0.7.6",
 		"ai": "^6.0.116",
 		"dompurify": "^3.3.3",
